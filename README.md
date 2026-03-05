@@ -16,6 +16,37 @@ Three modes:
 
 See [architecture.md](architecture.md) for the full system design.
 
+## Documentation Index
+
+### Architecture
+- [System Overview](docs/architecture/system-overview.md) — Two-layer design, data flow, technology stack, security model
+- [BigQuery Schema](docs/architecture/bigquery-schema.md) — All tables, columns, partitioning, query patterns
+
+### Data Pipeline
+- [Ingestion](docs/data-pipeline/ingestion.md) — Cloud Run Job: Alpaca, FRED, SEC EDGAR sources
+- [Transformations](docs/data-pipeline/transformations.md) — Dataform DAG: technical signals, fundamentals, screening master
+- [Historical Seed](docs/data-pipeline/seed-historical.md) — One-time 2022-present data backfill
+
+### Agents
+- [Orchestrator](docs/agents/orchestrator.md) — Root agent: intent classification and routing
+- [Stock Analysis](docs/agents/stock-analysis.md) — Mode A: single-ticker BUY/HOLD/SELL recommendations
+- [Screener](docs/agents/screener.md) — Mode C: natural language stock screening
+- [Q&A Agent](docs/agents/qa-agent.md) — Mode B: financial education and data lookups
+- [Research Service](docs/agents/research-service.md) — A2A deep-dive: SEC filings, sentiment, news
+
+### Tools
+- [Stock API (execute_screen)](docs/tools/stock-api.md) — Parameterized screening tool
+- [Realtime Quote (get_stock_profile)](docs/tools/realtime-quote.md) — BQ batch signals + yfinance live data
+- [MCP Toolbox](docs/tools/mcp-toolbox.md) — BigQuery toolset configuration
+- [Environment Setup](docs/tools/environment-setup.md) — Configuration, dependencies, troubleshooting
+
+### Deployment
+- [Cloud Run](docs/deployment/cloud-run.md) — Ingest job, research service, MCP Toolbox
+- [Vertex AI Agent Engine](docs/deployment/vertex-agent-engine.md) — Orchestrator deployment, sessions
+
+### Scripts
+- [Backtesting](docs/scripts/backtest.md) — Walk-forward evaluation of agent decisions
+
 ## Setup
 
 ### Prerequisites
