@@ -5,66 +5,96 @@ Tests the agent CONFIGURATION and STRUCTURE of the ADK multi-agent system:
 root orchestrator, stock_analysis_agent, qa_agent, screener_agent,
 research_proxy, BigQuery toolset, and module exports.
 
-The installed google.adk package (Python 3.9) does not include
-RemoteA2aAgent, so we inject a mock class into the module namespace
-before importing the module under test.
+The installed google.adk package (Python 3.9) is missing some symbols
+(RemoteA2aAgent, BigQueryToolConfig, WriteMode) from their expected
+import paths.  We also need to mock mcp_toolbox dependencies (yfinance,
+google.auth) that execute at module level.  We patch everything before
+importing the module under test.
 """
 
 import sys
 import os
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 
 # ---------------------------------------------------------------------------
-# Inject RemoteA2aAgent mock if it is not available in the installed SDK.
-# This MUST happen before any import of amfe_orchestrator.
+# Pre-import patching
 # ---------------------------------------------------------------------------
-_adk_agents_mod = sys.modules.get("google.adk.agents")
-_need_remote_mock = False
 
-if _adk_agents_mod is not None and not hasattr(_adk_agents_mod, "RemoteA2aAgent"):
-    _need_remote_mock = True
+# 1. Ensure BigQueryToolConfig and WriteMode are importable from
+#    google.adk.tools.bigquery (they live in .config sub-module).
+from google.adk.tools.bigquery.config import BigQueryToolConfig, WriteMode
+import google.adk.tools.bigquery as _bq_pkg
+if not hasattr(_bq_pkg, "BigQueryToolConfig"):
+    _bq_pkg.BigQueryToolConfig = BigQueryToolConfig
+if not hasattr(_bq_pkg, "WriteMode"):
+    _bq_pkg.WriteMode = WriteMode
 
-    class _MockRemoteA2aAgent:
-        """Lightweight stand-in for RemoteA2aAgent when the SDK lacks it."""
+# 2. Ensure RemoteA2aAgent is available from google.adk.agents.
+from google.adk import agents as _agents_pkg
+from google.adk.agents import BaseAgent
+_NEED_REMOTE_MOCK = not hasattr(_agents_pkg, "RemoteA2aAgent")
+if _NEED_REMOTE_MOCK:
 
-        def __init__(self, *, name, url, description=""):
-            self.name = name
-            self.url = url
-            self.description = description
+    class _MockRemoteA2aAgent(BaseAgent):
+        """Stand-in for RemoteA2aAgent when the SDK lacks it.
 
-    _adk_agents_mod.RemoteA2aAgent = _MockRemoteA2aAgent
-elif _adk_agents_mod is None:
-    # Module not yet imported — we preload it so the attribute exists
-    try:
-        from google.adk import agents as _agents_mod
-        if not hasattr(_agents_mod, "RemoteA2aAgent"):
-            _need_remote_mock = True
+        Inherits BaseAgent to pass pydantic validation in LlmAgent.sub_agents.
+        """
+        url: str = ""
+        description: str = ""
 
-            class _MockRemoteA2aAgent:
-                def __init__(self, *, name, url, description=""):
-                    self.name = name
-                    self.url = url
-                    self.description = description
+        model_config = {"arbitrary_types_allowed": True}
 
-            _agents_mod.RemoteA2aAgent = _MockRemoteA2aAgent
-    except ImportError:
-        pass
+    _agents_pkg.RemoteA2aAgent = _MockRemoteA2aAgent
 
+# 3. Mock yfinance before mcp_toolbox.realtime_quote tries to import it.
+if "yfinance" not in sys.modules:
+    sys.modules["yfinance"] = MagicMock()
 
-# ---------------------------------------------------------------------------
+# 4. Set required env vars before the module reads them.
+os.environ.setdefault("RESEARCH_SERVICE_URL", "http://localhost:8001")
+os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "test-project")
+os.environ.setdefault("BQ_DATASET", "amfe_data")
+os.environ.setdefault("BQ_TABLE", "screening_master")
+
+# 5. Mock BigQueryToolset to accept the `config` kwarg (newer API than installed).
+class _MockBigQueryToolset:
+    """Stand-in for BigQueryToolset that accepts the config kwarg.
+
+    Must be callable to pass pydantic validation in LlmAgent.tools.
+    """
+
+    def __init__(self, config=None, **kwargs):
+        self.config = config
+        self.name = "bigquery_toolset"
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+_bq_pkg.BigQueryToolset = _MockBigQueryToolset
+
+# 6. Patch google.auth.default AND google.cloud.bigquery.Client so
+#    mcp_toolbox modules don't fail at import.
+_mock_creds = MagicMock()
+_auth_patch = patch("google.auth.default", return_value=(_mock_creds, "test-project"))
+_bq_client_patch = patch("google.cloud.bigquery.Client")
+_auth_patch.start()
+_bq_client_patch.start()
+
 # Now safe to import the module under test
-# ---------------------------------------------------------------------------
 import amfe_orchestrator.agent as orch_mod  # noqa: E402
+
+_auth_patch.stop()
+_bq_client_patch.stop()
+
 from google.adk.agents import LlmAgent  # noqa: E402
 
-# Grab the RemoteA2aAgent class (real or mocked) for isinstance checks
-if _need_remote_mock:
-    RemoteA2aAgent = _MockRemoteA2aAgent  # type: ignore[name-defined]
-else:
-    from google.adk.agents import RemoteA2aAgent
+# Grab whatever RemoteA2aAgent is (real or mock) for isinstance checks
+_RemoteA2aAgent = _agents_pkg.RemoteA2aAgent
 
 
 # ===================================================================
@@ -280,7 +310,7 @@ class TestResearchProxy:
 
     def test_research_proxy_is_remote_agent(self):
         """research_proxy is a RemoteA2aAgent instance."""
-        assert isinstance(orch_mod.research_proxy, RemoteA2aAgent)
+        assert isinstance(orch_mod.research_proxy, _RemoteA2aAgent)
 
     def test_research_proxy_name(self):
         """Name is 'research_proxy'."""
@@ -310,7 +340,6 @@ class TestBigQueryToolset:
 
     def test_bq_toolset_write_mode(self):
         """WriteMode is ALLOWED on the BQ config."""
-        from google.adk.tools.bigquery import WriteMode
         config = orch_mod.bq_toolset.config
         assert config.write_mode == WriteMode.ALLOWED
 

@@ -34,7 +34,12 @@ import pytest
 
 
 def _load_research_module():
-    """Load research_service.agent with Python 3.9 compatibility patches."""
+    """Load research_service.agent with Python 3.9 compatibility patches.
+
+    The source uses ``str | None`` (PEP 604, Python 3.10+) and calls
+    ``LlmAgent.to_a2a()`` which may not exist in the installed SDK.
+    We patch both issues before executing the module code.
+    """
     # Set env vars that the module reads at import time
     os.environ.setdefault("GOOGLE_API_KEY", "fake-api-key")
     os.environ.setdefault("SEC_EDGAR_USER_AGENT", "Test/1.0 (test@example.com)")
@@ -47,9 +52,16 @@ def _load_research_module():
     with open(src_path, "r") as f:
         source = f.read()
 
-    # Add future annotations import at the top to defer evaluation
+    # Add future annotations import at the top to defer evaluation of PEP 604
     if "from __future__ import annotations" not in source:
         source = "from __future__ import annotations\n" + source
+
+    # Patch to_a2a() if the SDK doesn't support it — replace with a
+    # simple attribute assignment so ``app`` is still defined.
+    from google.adk.agents import LlmAgent as _LlmAgent
+    if not hasattr(_LlmAgent, "to_a2a"):
+        # Monkey-patch a stub onto LlmAgent
+        _LlmAgent.to_a2a = lambda self: MagicMock(name="a2a_app")
 
     code = compile(source, src_path, "exec")
 
@@ -57,7 +69,6 @@ def _load_research_module():
     mod.__file__ = src_path
     mod.__package__ = "research_service"
 
-    # Provide the imports the module expects
     exec(code, mod.__dict__)  # noqa: S102
 
     return mod
