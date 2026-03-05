@@ -1,0 +1,40 @@
+[project]
+name = "stonxai"
+version = "0.1.0"
+description = "Agentic Multi-model Financial Engine — Stock Analysis, Screening & Q&A on BigQuery + ADK"
+requires-python = ">=3.11"
+dependencies = [
+    # Google Cloud & ADK
+    "google-adk>=0.5.0",
+    "google-cloud-bigquery>=3.20.0",
+    "google-cloud-dataform>=0.5.0",
+    "google-auth>=2.28.0",
+    "google-cloud-run>=0.10.0",
+
+    # Data ingestion
+    "alpaca-py>=0.28.0",
+    "fredapi>=0.5.2",
+    "sec-edgar-downloader>=5.0.0",
+
+    # Realtime quotes
+    "yfinance>=0.2.36",
+
+    # Utilities
+    "python-dotenv>=1.0.0",
+    "pandas>=2.2.0",
+    "numpy>=1.26.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.3.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

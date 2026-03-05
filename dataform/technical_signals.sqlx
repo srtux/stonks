@@ -1,0 +1,235 @@
+config {
+  type: "table",
+  schema: "amfe_data",
+  description: "Daily technical indicators for all tickers",
+  bigquery: {
+    partitionBy: "date",
+    clusterBy: ["ticker"]
+  }
+}
+
+WITH source AS (
+  SELECT
+    ticker,
+    date,
+    open,
+    high,
+    low,
+    close,
+    volume,
+    -- Price changes for RSI
+    close - LAG(close, 1) OVER (PARTITION BY ticker ORDER BY date) AS price_change,
+    -- True Range components
+    high - low AS hl_range,
+    ABS(high - LAG(close, 1) OVER (PARTITION BY ticker ORDER BY date)) AS hc_range,
+    ABS(low  - LAG(close, 1) OVER (PARTITION BY ticker ORDER BY date)) AS lc_range,
+    -- Lagged closes for percent changes
+    LAG(close, 1)  OVER (PARTITION BY ticker ORDER BY date) AS close_1d_ago,
+    LAG(close, 5)  OVER (PARTITION BY ticker ORDER BY date) AS close_5d_ago,
+    LAG(close, 30) OVER (PARTITION BY ticker ORDER BY date) AS close_30d_ago,
+    -- 52-week high/low
+    MAX(high) OVER (
+      PARTITION BY ticker ORDER BY date
+      ROWS BETWEEN 251 PRECEDING AND CURRENT ROW
+    ) AS high_52w,
+    MIN(low) OVER (
+      PARTITION BY ticker ORDER BY date
+      ROWS BETWEEN 251 PRECEDING AND CURRENT ROW
+    ) AS low_52w,
+    ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date) AS rn
+  FROM `amfe_data.ohlcv_daily`
+),
+
+-- Separate gains and losses for RSI calculation
+rsi_components AS (
+  SELECT
+    *,
+    GREATEST(price_change, 0) AS gain,
+    GREATEST(-price_change, 0) AS loss
+  FROM source
+),
+
+-- RSI-14 using Wilder's smoothing approximation via windowed average
+rsi_calc AS (
+  SELECT
+    *,
+    AVG(gain) OVER (
+      PARTITION BY ticker ORDER BY date
+      ROWS BETWEEN 13 PRECEDING AND CURRENT ROW
+    ) AS avg_gain_14,
+    AVG(loss) OVER (
+      PARTITION BY ticker ORDER BY date
+      ROWS BETWEEN 13 PRECEDING AND CURRENT ROW
+    ) AS avg_loss_14,
+    AVG(gain) OVER (
+      PARTITION BY ticker ORDER BY date
+      ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+    ) AS avg_gain_2,
+    AVG(loss) OVER (
+      PARTITION BY ticker ORDER BY date
+      ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+    ) AS avg_loss_2
+  FROM rsi_components
+),
+
+-- MACD: approximate EMA with weighted averages
+-- EMA-12 alpha = 2/13, EMA-26 alpha = 2/27
+ema_components AS (
+  SELECT
+    *,
+    -- EMA-12 approximation: weighted average over 12 periods
+    -- Weights decay as (1 - 2/13)^k for lag k
+    (
+      SUM(close * POW(1.0 - 2.0/13.0, ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) -
+        ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC))) OVER (
+        PARTITION BY ticker ORDER BY date
+        ROWS BETWEEN 11 PRECEDING AND CURRENT ROW
+      )
+    ) AS ema12_num_placeholder, -- replaced below
+    close AS current_close
+  FROM rsi_calc
+),
+
+-- Compute EMA-12 and EMA-26 using recursive-style approximation with window functions
+ema_calc AS (
+  SELECT
+    rc.*,
+    -- EMA-12 approximation: simple weighted average over 12 bars
+    -- Using the sum of weights formula for exponential decay
+    (
+      SELECT SUM(sub.close * POW(1.0 - 2.0/13.0, rc.rn - sub.rn))
+        / NULLIF(SUM(POW(1.0 - 2.0/13.0, rc.rn - sub.rn)), 0)
+      FROM source sub
+      WHERE sub.ticker = rc.ticker
+        AND sub.rn BETWEEN GREATEST(rc.rn - 11, 1) AND rc.rn
+    ) AS ema_12,
+    (
+      SELECT SUM(sub.close * POW(1.0 - 2.0/27.0, rc.rn - sub.rn))
+        / NULLIF(SUM(POW(1.0 - 2.0/27.0, rc.rn - sub.rn)), 0)
+      FROM source sub
+      WHERE sub.ticker = rc.ticker
+        AND sub.rn BETWEEN GREATEST(rc.rn - 25, 1) AND rc.rn
+    ) AS ema_26
+  FROM rsi_calc rc
+),
+
+macd_line AS (
+  SELECT
+    *,
+    ema_12 - ema_26 AS macd
+  FROM ema_calc
+),
+
+-- Signal line: 9-period EMA of MACD
+macd_signal AS (
+  SELECT
+    ml.*,
+    (
+      SELECT SUM(sub.macd * POW(1.0 - 2.0/10.0, ml.rn - sub.rn))
+        / NULLIF(SUM(POW(1.0 - 2.0/10.0, ml.rn - sub.rn)), 0)
+      FROM macd_line sub
+      WHERE sub.ticker = ml.ticker
+        AND sub.rn BETWEEN GREATEST(ml.rn - 8, 1) AND ml.rn
+    ) AS macd_signal
+  FROM macd_line ml
+),
+
+-- Bollinger Bands, SMAs, ATR
+indicators AS (
+  SELECT
+    ms.*,
+
+    -- Bollinger Bands: 20-day SMA +/- 2 std dev
+    AVG(ms.close) OVER (
+      PARTITION BY ms.ticker ORDER BY ms.date
+      ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+    ) AS bb_sma_20,
+    STDDEV_POP(ms.close) OVER (
+      PARTITION BY ms.ticker ORDER BY ms.date
+      ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+    ) AS bb_stddev_20,
+
+    -- Simple Moving Averages
+    AVG(ms.close) OVER (
+      PARTITION BY ms.ticker ORDER BY ms.date
+      ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+    ) AS sma_20,
+    AVG(ms.close) OVER (
+      PARTITION BY ms.ticker ORDER BY ms.date
+      ROWS BETWEEN 49 PRECEDING AND CURRENT ROW
+    ) AS sma_50,
+    AVG(ms.close) OVER (
+      PARTITION BY ms.ticker ORDER BY ms.date
+      ROWS BETWEEN 199 PRECEDING AND CURRENT ROW
+    ) AS sma_200,
+
+    -- ATR-14: average of true range over 14 days
+    AVG(GREATEST(ms.hl_range, ms.hc_range, ms.lc_range)) OVER (
+      PARTITION BY ms.ticker ORDER BY ms.date
+      ROWS BETWEEN 13 PRECEDING AND CURRENT ROW
+    ) AS atr_14
+
+  FROM macd_signal ms
+)
+
+SELECT
+  ticker,
+  date,
+  open,
+  high,
+  low,
+  close,
+  volume,
+
+  -- RSI-14
+  CASE
+    WHEN avg_loss_14 = 0 THEN 100.0
+    ELSE 100.0 - (100.0 / (1.0 + avg_gain_14 / avg_loss_14))
+  END AS rsi_14,
+
+  -- RSI-2
+  CASE
+    WHEN avg_loss_2 = 0 THEN 100.0
+    ELSE 100.0 - (100.0 / (1.0 + avg_gain_2 / avg_loss_2))
+  END AS rsi_2,
+
+  -- MACD
+  macd AS macd_line,
+  macd_signal AS macd_signal_line,
+  macd - macd_signal AS macd_histogram,
+
+  -- Bollinger Bands
+  bb_sma_20 + 2 * bb_stddev_20 AS bb_upper,
+  bb_sma_20 AS bb_middle,
+  bb_sma_20 - 2 * bb_stddev_20 AS bb_lower,
+  SAFE_DIVIDE(
+    close - (bb_sma_20 - 2 * bb_stddev_20),
+    (bb_sma_20 + 2 * bb_stddev_20) - (bb_sma_20 - 2 * bb_stddev_20)
+  ) AS bb_pct,
+
+  -- SMAs and distance from price
+  sma_20,
+  sma_50,
+  sma_200,
+  SAFE_DIVIDE(close - sma_20,  sma_20)  AS dist_from_sma_20,
+  SAFE_DIVIDE(close - sma_50,  sma_50)  AS dist_from_sma_50,
+  SAFE_DIVIDE(close - sma_200, sma_200) AS dist_from_sma_200,
+
+  -- SMA cross
+  sma_20 - sma_50 AS sma_cross_20_50,
+
+  -- ATR-14
+  atr_14,
+
+  -- Price changes
+  SAFE_DIVIDE(close - close_1d_ago,  close_1d_ago)  AS pct_change_1d,
+  SAFE_DIVIDE(close - close_5d_ago,  close_5d_ago)  AS pct_change_5d,
+  SAFE_DIVIDE(close - close_30d_ago, close_30d_ago) AS pct_change_30d,
+
+  -- 52-week high/low
+  high_52w,
+  low_52w,
+  SAFE_DIVIDE(close - high_52w, high_52w) AS pct_from_52w_high
+
+FROM indicators
+WHERE rn >= 2  -- need at least one prior row for price_change

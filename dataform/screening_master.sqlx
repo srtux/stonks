@@ -1,0 +1,179 @@
+config {
+  type: "table",
+  schema: "amfe_data",
+  description: "Master screening table joining technical signals, fundamental scores, macro regime, and ML forecasts",
+  bigquery: {
+    partitionBy: "date",
+    clusterBy: ["ticker", "sector", "signal_label"]
+  }
+}
+
+WITH tech AS (
+  SELECT * FROM ${ref("technical_signals")}
+),
+
+fund AS (
+  SELECT * FROM ${ref("fundamental_scores")}
+),
+
+macro AS (
+  SELECT
+    date,
+    vix_close,
+    fed_funds_rate,
+    us_10y_yield,
+    us_2y_yield,
+    us_10y_yield - us_2y_yield AS yield_spread,
+    sp500_close,
+    -- 50-day SMA of S&P 500 for trend detection
+    AVG(sp500_close) OVER (
+      ORDER BY date
+      ROWS BETWEEN 49 PRECEDING AND CURRENT ROW
+    ) AS sp500_sma_50,
+    -- 200-day SMA of S&P 500
+    AVG(sp500_close) OVER (
+      ORDER BY date
+      ROWS BETWEEN 199 PRECEDING AND CURRENT ROW
+    ) AS sp500_sma_200
+  FROM `amfe_data.macro_indicators`
+),
+
+-- HMM regime classification using VIX levels + S&P 500 trend
+regime AS (
+  SELECT
+    date,
+    vix_close,
+    fed_funds_rate,
+    us_10y_yield,
+    us_2y_yield,
+    yield_spread,
+    sp500_close,
+    sp500_sma_50,
+    sp500_sma_200,
+    CASE
+      -- Bull: S&P above 200-day SMA; Quiet: VIX below 20
+      WHEN sp500_close > sp500_sma_200 AND vix_close < 20 THEN 'BULL_QUIET'
+      -- Bull: S&P above 200-day SMA; Volatile: VIX >= 20
+      WHEN sp500_close > sp500_sma_200 AND vix_close >= 20 THEN 'BULL_VOLATILE'
+      -- Bear: S&P below 200-day SMA; Quiet: VIX below 25
+      WHEN sp500_close <= sp500_sma_200 AND vix_close < 25 THEN 'BEAR_QUIET'
+      -- Bear: S&P below 200-day SMA; Volatile: VIX >= 25
+      WHEN sp500_close <= sp500_sma_200 AND vix_close >= 25 THEN 'BEAR_VOLATILE'
+      ELSE 'SIDEWAYS'
+    END AS hmm_regime
+  FROM macro
+),
+
+-- Join all data sources
+combined AS (
+  SELECT
+    t.ticker,
+    t.date,
+    t.open,
+    t.high,
+    t.low,
+    t.close,
+    t.volume,
+
+    -- Technical signals
+    t.rsi_14,
+    t.rsi_2,
+    t.macd_line,
+    t.macd_signal_line,
+    t.macd_histogram,
+    t.bb_upper,
+    t.bb_middle,
+    t.bb_lower,
+    t.bb_pct,
+    t.sma_20,
+    t.sma_50,
+    t.sma_200,
+    t.dist_from_sma_20,
+    t.dist_from_sma_50,
+    t.dist_from_sma_200,
+    t.sma_cross_20_50,
+    t.atr_14,
+    t.pct_change_1d,
+    t.pct_change_5d,
+    t.pct_change_30d,
+    t.high_52w,
+    t.low_52w,
+    t.pct_from_52w_high,
+
+    -- Fundamental scores
+    f.latest_filing_date,
+    f.latest_period_end_date,
+    f.pe_ratio,
+    f.pb_ratio,
+    f.ps_ratio,
+    f.debt_to_equity,
+    f.current_ratio,
+    f.revenue_growth_qoq,
+    f.revenue_growth_yoy,
+    f.earnings_surprise_pct,
+    f.earnings_per_share,
+    f.book_value_per_share,
+    f.revenue,
+    f.net_income,
+    f.shares_outstanding,
+
+    -- Macro / regime
+    r.vix_close,
+    r.fed_funds_rate,
+    r.us_10y_yield,
+    r.us_2y_yield,
+    r.yield_spread,
+    r.sp500_close,
+    r.sp500_sma_50   AS sp500_sma_50,
+    r.sp500_sma_200  AS sp500_sma_200,
+    r.hmm_regime,
+
+    -- Sector (from OHLCV or a separate dimension table)
+    COALESCE(t.sector, 'UNKNOWN') AS sector,
+
+    -- ML forecast placeholders (populated by ML.FORECAST later)
+    CAST(NULL AS FLOAT64) AS bq_forecast_5d_pct,
+    CAST(NULL AS FLOAT64) AS bq_forecast_30d_pct
+
+  FROM tech t
+  LEFT JOIN fund f
+    ON t.ticker = f.ticker
+    AND t.date = f.date
+  LEFT JOIN regime r
+    ON t.date = r.date
+),
+
+-- Compute composite score and signal label
+scored AS (
+  SELECT
+    *,
+    CASE hmm_regime
+      WHEN 'BULL_QUIET' THEN
+          0.40 * TANH(COALESCE(bq_forecast_5d_pct, 0) * 10)
+        + 0.25 * (50 - COALESCE(rsi_14, 50)) / 50
+        + 0.20 * SIGN(COALESCE(macd_histogram, 0))
+        + 0.15 * SIGN(COALESCE(sma_cross_20_50, 0))
+      WHEN 'BEAR_VOLATILE' THEN
+          0.10 * TANH(COALESCE(bq_forecast_5d_pct, 0) * 10)
+        + 0.50 * (50 - COALESCE(rsi_14, 50)) / 50
+        + 0.25 * SIGN(COALESCE(macd_histogram, 0))
+        + 0.15 * SIGN(COALESCE(sma_cross_20_50, 0))
+      ELSE
+          0.30 * TANH(COALESCE(bq_forecast_5d_pct, 0) * 10)
+        + 0.30 * (50 - COALESCE(rsi_14, 50)) / 50
+        + 0.20 * SIGN(COALESCE(macd_histogram, 0))
+        + 0.20 * SIGN(COALESCE(sma_cross_20_50, 0))
+    END AS composite_score
+  FROM combined
+)
+
+SELECT
+  *,
+  CASE
+    WHEN composite_score >  0.6 THEN 'STRONG_BUY'
+    WHEN composite_score >  0.2 THEN 'BUY'
+    WHEN composite_score > -0.2 THEN 'HOLD'
+    WHEN composite_score > -0.6 THEN 'SELL'
+    ELSE 'STRONG_SELL'
+  END AS signal_label
+FROM scored

@@ -1,0 +1,24 @@
+toolsets:
+  amfe-bq-toolset:
+    type: bigquery
+    project: ${GOOGLE_CLOUD_PROJECT}
+    dataset: amfe_data
+    tools:
+      - name: execute_sql
+        description: "Execute a read-only SQL query against the AMFE BigQuery dataset"
+        type: sql_query
+      - name: forecast
+        description: "Run BigQuery ML.FORECAST for a ticker's 5-day price prediction using TimesFM"
+        type: sql_query
+        template: |
+          SELECT * FROM ML.FORECAST(
+            MODEL `amfe_data.timesfm_model`,
+            STRUCT(5 AS horizon, 0.9 AS confidence_level)
+          )
+          WHERE ticker = @ticker
+      - name: ask_data_insights
+        description: "Ask a natural language question about the AMFE dataset using BigQuery conversational analytics"
+        type: data_insights
+      - name: get_table_info
+        description: "Get schema and metadata for a table in the amfe_data dataset"
+        type: table_info

@@ -1,0 +1,9 @@
+config {
+  type: "view",
+  schema: "amfe_data",
+  description: "Latest day snapshot of the screening master table"
+}
+
+SELECT *
+FROM ${ref("screening_master")}
+WHERE date = (SELECT MAX(date) FROM ${ref("screening_master")})

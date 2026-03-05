@@ -1,0 +1,215 @@
+config {
+  type: "table",
+  schema: "amfe_data",
+  description: "Fundamental scores per ticker per trading day, forward-filled from SEC filings",
+  bigquery: {
+    partitionBy: "date",
+    clusterBy: ["ticker"]
+  }
+}
+
+WITH filing_data AS (
+  SELECT
+    ticker,
+    filing_date,
+    period_end_date,
+    -- Per-share metrics
+    earnings_per_share,
+    book_value_per_share,
+    -- Income statement
+    revenue,
+    net_income,
+    -- Balance sheet
+    total_debt,
+    total_equity,
+    current_assets,
+    current_liabilities,
+    total_assets,
+    shares_outstanding,
+    -- Earnings surprise
+    earnings_estimate,
+    earnings_actual
+  FROM `amfe_data.sec_filings`
+),
+
+-- Compute QoQ and YoY growth on the filing grain
+filing_with_growth AS (
+  SELECT
+    f.*,
+    -- Revenue growth QoQ
+    LAG(f.revenue, 1) OVER (
+      PARTITION BY f.ticker ORDER BY f.period_end_date
+    ) AS revenue_prev_q,
+    -- Revenue growth YoY (4 quarters back)
+    LAG(f.revenue, 4) OVER (
+      PARTITION BY f.ticker ORDER BY f.period_end_date
+    ) AS revenue_prev_y
+  FROM filing_data f
+),
+
+filing_scores AS (
+  SELECT
+    ticker,
+    filing_date,
+    period_end_date,
+    earnings_per_share,
+    book_value_per_share,
+    revenue,
+    net_income,
+    shares_outstanding,
+    -- Debt-to-equity
+    SAFE_DIVIDE(total_debt, total_equity) AS debt_to_equity,
+    -- Current ratio
+    SAFE_DIVIDE(current_assets, current_liabilities) AS current_ratio,
+    -- Revenue growth QoQ
+    SAFE_DIVIDE(revenue - revenue_prev_q, ABS(revenue_prev_q)) AS revenue_growth_qoq,
+    -- Revenue growth YoY
+    SAFE_DIVIDE(revenue - revenue_prev_y, ABS(revenue_prev_y)) AS revenue_growth_yoy,
+    -- Earnings surprise
+    SAFE_DIVIDE(
+      earnings_actual - earnings_estimate,
+      ABS(earnings_estimate)
+    ) AS earnings_surprise_pct
+  FROM filing_with_growth
+),
+
+-- Get all trading days per ticker from OHLCV
+trading_days AS (
+  SELECT
+    ticker,
+    date,
+    close,
+    volume
+  FROM `amfe_data.ohlcv_daily`
+),
+
+-- Join filings onto trading days: attach the most recent filing on or before each trading day
+-- Using a point-in-time join to avoid look-ahead bias
+joined AS (
+  SELECT
+    td.ticker,
+    td.date,
+    td.close,
+    td.volume,
+    fs.filing_date,
+    fs.period_end_date,
+    fs.earnings_per_share,
+    fs.book_value_per_share,
+    fs.revenue,
+    fs.net_income,
+    fs.shares_outstanding,
+    fs.debt_to_equity,
+    fs.current_ratio,
+    fs.revenue_growth_qoq,
+    fs.revenue_growth_yoy,
+    fs.earnings_surprise_pct
+  FROM trading_days td
+  LEFT JOIN filing_scores fs
+    ON td.ticker = fs.ticker
+    AND fs.filing_date = (
+      SELECT MAX(fs2.filing_date)
+      FROM filing_scores fs2
+      WHERE fs2.ticker = td.ticker
+        AND fs2.filing_date <= td.date
+    )
+),
+
+-- Forward-fill fundamentals using LAST_VALUE IGNORE NULLS for any remaining gaps
+forward_filled AS (
+  SELECT
+    ticker,
+    date,
+    close,
+    volume,
+    filing_date,
+    period_end_date,
+
+    LAST_VALUE(earnings_per_share IGNORE NULLS) OVER (
+      PARTITION BY ticker ORDER BY date
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS earnings_per_share,
+
+    LAST_VALUE(book_value_per_share IGNORE NULLS) OVER (
+      PARTITION BY ticker ORDER BY date
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS book_value_per_share,
+
+    LAST_VALUE(revenue IGNORE NULLS) OVER (
+      PARTITION BY ticker ORDER BY date
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS revenue,
+
+    LAST_VALUE(net_income IGNORE NULLS) OVER (
+      PARTITION BY ticker ORDER BY date
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS net_income,
+
+    LAST_VALUE(shares_outstanding IGNORE NULLS) OVER (
+      PARTITION BY ticker ORDER BY date
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS shares_outstanding,
+
+    LAST_VALUE(debt_to_equity IGNORE NULLS) OVER (
+      PARTITION BY ticker ORDER BY date
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS debt_to_equity,
+
+    LAST_VALUE(current_ratio IGNORE NULLS) OVER (
+      PARTITION BY ticker ORDER BY date
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS current_ratio,
+
+    LAST_VALUE(revenue_growth_qoq IGNORE NULLS) OVER (
+      PARTITION BY ticker ORDER BY date
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS revenue_growth_qoq,
+
+    LAST_VALUE(revenue_growth_yoy IGNORE NULLS) OVER (
+      PARTITION BY ticker ORDER BY date
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS revenue_growth_yoy,
+
+    LAST_VALUE(earnings_surprise_pct IGNORE NULLS) OVER (
+      PARTITION BY ticker ORDER BY date
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS earnings_surprise_pct
+  FROM joined
+)
+
+SELECT
+  ticker,
+  date,
+  close,
+  filing_date AS latest_filing_date,
+  period_end_date AS latest_period_end_date,
+
+  -- P/E ratio
+  SAFE_DIVIDE(close, earnings_per_share) AS pe_ratio,
+
+  -- P/B ratio
+  SAFE_DIVIDE(close, book_value_per_share) AS pb_ratio,
+
+  -- P/S ratio (market_cap / revenue)
+  SAFE_DIVIDE(close * shares_outstanding, revenue) AS ps_ratio,
+
+  -- Debt-to-equity
+  debt_to_equity,
+
+  -- Current ratio
+  current_ratio,
+
+  -- Revenue growth
+  revenue_growth_qoq,
+  revenue_growth_yoy,
+
+  -- Earnings surprise
+  earnings_surprise_pct,
+
+  -- Raw values for downstream use
+  earnings_per_share,
+  book_value_per_share,
+  revenue,
+  net_income,
+  shares_outstanding
+
+FROM forward_filled
