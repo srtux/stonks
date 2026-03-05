@@ -21,34 +21,23 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# Mock modules not installed locally (alpaca, fredapi)
+# Mock modules not installed locally (alpaca, fredapi) before import
 # ---------------------------------------------------------------------------
-def _ensure_mock_modules():
-    mocks = {}
-    for mod_path in [
-        "alpaca",
-        "alpaca.data",
-        "alpaca.data.historical",
-        "alpaca.data.requests",
-        "alpaca.data.timeframe",
-        "fredapi",
-        "dotenv",
-    ]:
-        if mod_path not in sys.modules:
-            m = MagicMock()
-            sys.modules[mod_path] = m
-            mocks[mod_path] = m
-        else:
-            # Ensure submodules exist on parent
-            parts = mod_path.split(".")
-            if len(parts) > 1:
-                parent = ".".join(parts[:-1])
-                if parent in sys.modules:
-                    setattr(sys.modules[parent], parts[-1], sys.modules[mod_path])
+_mock_alpaca = MagicMock()
+_mock_alpaca_data = MagicMock()
+_mock_alpaca_data_hist = MagicMock()
+_mock_alpaca_data_req = MagicMock()
+_mock_alpaca_data_tf = MagicMock()
+_mock_alpaca_data_tf.TimeFrame = SimpleNamespace(Day="1Day")
+_mock_fredapi = MagicMock()
 
-    # Set up TimeFrame.Day
-    sys.modules["alpaca.data.timeframe"].TimeFrame = SimpleNamespace(Day="1Day")
-    return mocks
+# Install mocks before any import of seed_historical
+sys.modules.setdefault("alpaca", _mock_alpaca)
+sys.modules.setdefault("alpaca.data", _mock_alpaca_data)
+sys.modules.setdefault("alpaca.data.historical", _mock_alpaca_data_hist)
+sys.modules.setdefault("alpaca.data.requests", _mock_alpaca_data_req)
+sys.modules.setdefault("alpaca.data.timeframe", _mock_alpaca_data_tf)
+sys.modules.setdefault("fredapi", _mock_fredapi)
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +55,6 @@ def _seed_env(monkeypatch):
 @pytest.fixture()
 def mod(monkeypatch):
     """Import/reload scripts.seed_historical with external deps mocked."""
-    _ensure_mock_modules()
     with patch("google.cloud.bigquery.Client") as mock_bq_cls:
         mock_client = MagicMock()
         mock_bq_cls.return_value = mock_client
@@ -75,8 +63,6 @@ def mod(monkeypatch):
             m = importlib.reload(sys.modules["scripts.seed_historical"])
         else:
             m = importlib.import_module("scripts.seed_historical")
-        m._mock_bq_client = mock_client
-        # Also patch the module-level bq_client
         m.bq_client = mock_client
     return m
 
@@ -100,16 +86,6 @@ def _make_bars_response(bars_by_symbol: dict):
     return SimpleNamespace(data=bars_by_symbol)
 
 
-def _setup_alpaca_mock(mod, bars_response):
-    """Set up the Alpaca mock at module-import level."""
-    mock_cls = MagicMock()
-    mock_instance = MagicMock()
-    mock_cls.return_value = mock_instance
-    mock_instance.get_stock_bars.return_value = bars_response
-    sys.modules["alpaca.data.historical"].StockHistoricalDataClient = mock_cls
-    return mock_instance
-
-
 def _make_series(data: dict):
     return pd.Series(list(data.values()), index=list(data.keys()))
 
@@ -122,36 +98,42 @@ class TestFetchOhlcv:
     @patch("time.sleep")
     def test_fetch_ohlcv_success(self, mock_sleep, mod):
         bars = _make_bars_response({"AAPL": [_make_bar("AAPL")]})
-        alpaca_inst = _setup_alpaca_mock(mod, bars)
+        mock_alpaca_inst = MagicMock()
+        mock_alpaca_inst.get_stock_bars.return_value = bars
         load_job = MagicMock()
         mod.bq_client.load_table_from_dataframe.return_value = load_job
 
-        mod.fetch_ohlcv(["AAPL"])
+        with patch.object(mod, "StockHistoricalDataClient", return_value=mock_alpaca_inst):
+            mod.fetch_ohlcv(["AAPL"])
 
-        alpaca_inst.get_stock_bars.assert_called_once()
+        mock_alpaca_inst.get_stock_bars.assert_called_once()
 
     @patch("time.sleep")
     def test_fetch_ohlcv_batching(self, mock_sleep, mod):
         """BATCH_SIZE=10, so 25 tickers should produce 3 batches."""
         bars = _make_bars_response({})
-        alpaca_inst = _setup_alpaca_mock(mod, bars)
+        mock_alpaca_inst = MagicMock()
+        mock_alpaca_inst.get_stock_bars.return_value = bars
         load_job = MagicMock()
         mod.bq_client.load_table_from_dataframe.return_value = load_job
 
         tickers = [f"T{i:03d}" for i in range(25)]
-        mod.fetch_ohlcv(tickers)
+        with patch.object(mod, "StockHistoricalDataClient", return_value=mock_alpaca_inst):
+            mod.fetch_ohlcv(tickers)
 
-        assert alpaca_inst.get_stock_bars.call_count == 3
+        assert mock_alpaca_inst.get_stock_bars.call_count == 3
 
     @patch("time.sleep")
     def test_fetch_ohlcv_rate_limiting(self, mock_sleep, mod):
         bars = _make_bars_response({})
-        _setup_alpaca_mock(mod, bars)
+        mock_alpaca_inst = MagicMock()
+        mock_alpaca_inst.get_stock_bars.return_value = bars
         load_job = MagicMock()
         mod.bq_client.load_table_from_dataframe.return_value = load_job
 
         tickers = [f"T{i:03d}" for i in range(25)]
-        mod.fetch_ohlcv(tickers)
+        with patch.object(mod, "StockHistoricalDataClient", return_value=mock_alpaca_inst):
+            mod.fetch_ohlcv(tickers)
 
         # sleep called once per batch (3 batches)
         assert mock_sleep.call_count == 3
@@ -160,11 +142,13 @@ class TestFetchOhlcv:
     @patch("time.sleep")
     def test_fetch_ohlcv_bq_write(self, mock_sleep, mod):
         bars = _make_bars_response({"AAPL": [_make_bar("AAPL")]})
-        _setup_alpaca_mock(mod, bars)
+        mock_alpaca_inst = MagicMock()
+        mock_alpaca_inst.get_stock_bars.return_value = bars
         load_job = MagicMock()
         mod.bq_client.load_table_from_dataframe.return_value = load_job
 
-        mod.fetch_ohlcv(["AAPL"])
+        with patch.object(mod, "StockHistoricalDataClient", return_value=mock_alpaca_inst):
+            mod.fetch_ohlcv(["AAPL"])
 
         mod.bq_client.load_table_from_dataframe.assert_called_once()
         call_args = mod.bq_client.load_table_from_dataframe.call_args
@@ -177,11 +161,13 @@ class TestFetchOhlcv:
     @patch("time.sleep")
     def test_fetch_ohlcv_row_format(self, mock_sleep, mod):
         bars = _make_bars_response({"NVDA": [_make_bar("NVDA")]})
-        _setup_alpaca_mock(mod, bars)
+        mock_alpaca_inst = MagicMock()
+        mock_alpaca_inst.get_stock_bars.return_value = bars
         load_job = MagicMock()
         mod.bq_client.load_table_from_dataframe.return_value = load_job
 
-        mod.fetch_ohlcv(["NVDA"])
+        with patch.object(mod, "StockHistoricalDataClient", return_value=mock_alpaca_inst):
+            mod.fetch_ohlcv(["NVDA"])
 
         df_arg = mod.bq_client.load_table_from_dataframe.call_args[0][0]
         expected_cols = {"ticker", "date", "open", "high", "low", "close", "volume", "adj_close"}
@@ -191,11 +177,13 @@ class TestFetchOhlcv:
     def test_fetch_ohlcv_date_format(self, mock_sleep, mod):
         ts = datetime(2026, 3, 4, 16, 0, 0)
         bars = _make_bars_response({"AAPL": [_make_bar("AAPL", ts=ts)]})
-        _setup_alpaca_mock(mod, bars)
+        mock_alpaca_inst = MagicMock()
+        mock_alpaca_inst.get_stock_bars.return_value = bars
         load_job = MagicMock()
         mod.bq_client.load_table_from_dataframe.return_value = load_job
 
-        mod.fetch_ohlcv(["AAPL"])
+        with patch.object(mod, "StockHistoricalDataClient", return_value=mock_alpaca_inst):
+            mod.fetch_ohlcv(["AAPL"])
 
         df_arg = mod.bq_client.load_table_from_dataframe.call_args[0][0]
         date_val = df_arg["date"].iloc[0]
@@ -213,13 +201,11 @@ class TestFetchMacro:
         load_job = MagicMock()
         mod.bq_client.load_table_from_dataframe.return_value = load_job
 
-        mock_fred_cls = MagicMock()
         mock_fred_inst = MagicMock()
-        mock_fred_cls.return_value = mock_fred_inst
         mock_fred_inst.get_series.return_value = series
-        sys.modules["fredapi"].Fred = mock_fred_cls
 
-        mod.fetch_macro()
+        with patch.object(mod, "Fred", return_value=mock_fred_inst):
+            mod.fetch_macro()
 
         assert mock_fred_inst.get_series.call_count == 3
         mod.bq_client.load_table_from_dataframe.assert_called_once()
@@ -231,13 +217,11 @@ class TestFetchMacro:
         load_job = MagicMock()
         mod.bq_client.load_table_from_dataframe.return_value = load_job
 
-        mock_fred_cls = MagicMock()
         mock_fred_inst = MagicMock()
-        mock_fred_cls.return_value = mock_fred_inst
         mock_fred_inst.get_series.return_value = series
-        sys.modules["fredapi"].Fred = mock_fred_cls
 
-        mod.fetch_macro()
+        with patch.object(mod, "Fred", return_value=mock_fred_inst):
+            mod.fetch_macro()
 
         df_arg = mod.bq_client.load_table_from_dataframe.call_args[0][0]
         # 3 series * 1 valid value each = 3 rows (NaN filtered out)
@@ -250,13 +234,11 @@ class TestFetchMacro:
         load_job = MagicMock()
         mod.bq_client.load_table_from_dataframe.return_value = load_job
 
-        mock_fred_cls = MagicMock()
         mock_fred_inst = MagicMock()
-        mock_fred_cls.return_value = mock_fred_inst
         mock_fred_inst.get_series.return_value = series
-        sys.modules["fredapi"].Fred = mock_fred_cls
 
-        mod.fetch_macro()
+        with patch.object(mod, "Fred", return_value=mock_fred_inst):
+            mod.fetch_macro()
 
         call_args = mod.bq_client.load_table_from_dataframe.call_args
         job_config = call_args[1]["job_config"]
